@@ -211,7 +211,7 @@ void WindowSDL::initTimers() {
     SDL_AddTimer(33, Input::MousePolling, (void*)controller);
 }
 
-void WindowSDL::OnResize() {
+void WindowSDL::onResize() {
     SDL_GetWindowSizeInPixels(window, &width, &height);
     ImGui::Core::OnResize();
 }
