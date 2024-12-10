@@ -6,10 +6,7 @@
 #include <mutex>
 #include <semaphore>
 
-#include "core/libraries/kernel/sync/semaphore.h"
-
 #include "common/logging/log.h"
-#include "common/slot_vector.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -24,7 +21,7 @@ constexpr int ORBIS_KERNEL_SEM_VALUE_MAX = 0x7FFFFFFF;
 struct PthreadSem {
     explicit PthreadSem(s32 value_) : semaphore{value_}, value{value_} {}
 
-    CountingSemaphore semaphore;
+    std::counting_semaphore<ORBIS_KERNEL_SEM_VALUE_MAX> semaphore;
     std::atomic<s32> value;
 };
 
@@ -78,7 +75,7 @@ public:
             it = wait_list.erase(it);
             token_count -= waiter->need_count;
             waiter->was_signaled = true;
-            waiter->sem.release();
+            waiter->cv.notify_one();
         }
 
         return true;
@@ -91,7 +88,7 @@ public:
         }
         for (auto* waiter : wait_list) {
             waiter->was_cancled = true;
-            waiter->sem.release();
+            waiter->cv.notify_one();
         }
         wait_list.clear();
         token_count = set_count < 0 ? init_count : set_count;
@@ -102,29 +99,25 @@ public:
         std::scoped_lock lk{mutex};
         for (auto* waiter : wait_list) {
             waiter->was_deleted = true;
-            waiter->sem.release();
+            waiter->cv.notify_one();
         }
         wait_list.clear();
     }
 
 public:
     struct WaitingThread {
-        BinarySemaphore sem;
+        std::condition_variable cv;
         u32 priority;
         s32 need_count;
-        std::string thr_name;
         bool was_signaled{};
         bool was_deleted{};
         bool was_cancled{};
 
-        explicit WaitingThread(s32 need_count, bool is_fifo)
-            : sem{0}, priority{0}, need_count{need_count} {
+        explicit WaitingThread(s32 need_count, bool is_fifo) : need_count{need_count} {
             // Retrieve calling thread priority for sorting into waiting threads list.
             if (!is_fifo) {
                 priority = g_curthread->attr.prio;
             }
-
-            thr_name = g_curthread->name;
         }
 
         int GetResult(bool timed_out) {
@@ -141,26 +134,24 @@ public:
         }
 
         int Wait(std::unique_lock<std::mutex>& lk, u32* timeout) {
-            lk.unlock();
             if (!timeout) {
                 // Wait indefinitely until we are woken up.
-                sem.acquire();
-                lk.lock();
+                cv.wait(lk);
                 return GetResult(false);
             }
             // Wait until timeout runs out, recording how much remaining time there was.
             const auto start = std::chrono::high_resolution_clock::now();
-            sem.try_acquire_for(std::chrono::microseconds(*timeout));
+            const auto signaled = cv.wait_for(lk, std::chrono::microseconds(*timeout),
+                                              [this] { return was_signaled; });
             const auto end = std::chrono::high_resolution_clock::now();
             const auto time =
                 std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-            lk.lock();
-            if (was_signaled) {
+            if (signaled) {
                 *timeout -= time;
             } else {
                 *timeout = 0;
             }
-            return GetResult(!was_signaled);
+            return GetResult(!signaled);
         }
     };
 
@@ -189,9 +180,7 @@ public:
     bool is_fifo;
 };
 
-using OrbisKernelSema = Common::SlotId;
-
-static Common::SlotVector<std::unique_ptr<OrbisSem>> orbis_sems;
+using OrbisKernelSema = OrbisSem*;
 
 s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u32 attr,
                                      s32 initCount, s32 maxCount, const void* pOptParam) {
@@ -199,48 +188,46 @@ s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u3
         LOG_ERROR(Lib_Kernel, "Semaphore creation parameters are invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    *sem = orbis_sems.insert(
-        std::move(std::make_unique<OrbisSem>(initCount, maxCount, pName, attr == 1)));
+    *sem = new OrbisSem(initCount, maxCount, pName, attr == 1);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTimeout) {
-    if (!orbis_sems.is_allocated(sem)) {
+    if (!sem) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Wait(true, needCount, pTimeout);
+    return sem->Wait(true, needCount, pTimeout);
 }
 
 s32 PS4_SYSV_ABI sceKernelSignalSema(OrbisKernelSema sem, s32 signalCount) {
-    if (!orbis_sems.is_allocated(sem)) {
+    if (!sem) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    if (!orbis_sems[sem]->Signal(signalCount)) {
+    if (!sem->Signal(signalCount)) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceKernelPollSema(OrbisKernelSema sem, s32 needCount) {
-    if (!orbis_sems.is_allocated(sem)) {
+    if (!sem) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Wait(false, needCount, nullptr);
+    return sem->Wait(false, needCount, nullptr);
 }
 
 int PS4_SYSV_ABI sceKernelCancelSema(OrbisKernelSema sem, s32 setCount, s32* pNumWaitThreads) {
-    if (!orbis_sems.is_allocated(sem)) {
+    if (!sem) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Cancel(setCount, pNumWaitThreads);
+    return sem->Cancel(setCount, pNumWaitThreads);
 }
 
 int PS4_SYSV_ABI sceKernelDeleteSema(OrbisKernelSema sem) {
-    if (!orbis_sems.is_allocated(sem)) {
+    if (!sem) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    orbis_sems[sem]->Delete();
-    orbis_sems.erase(sem);
+    sem->Delete();
     return ORBIS_OK;
 }
 
@@ -252,16 +239,6 @@ int PS4_SYSV_ABI posix_sem_init(PthreadSem** sem, int pshared, u32 value) {
     if (sem != nullptr) {
         *sem = new PthreadSem(value);
     }
-    return 0;
-}
-
-int PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
-    if (sem == nullptr || *sem == nullptr) {
-        *__Error() = POSIX_EINVAL;
-        return -1;
-    }
-    delete *sem;
-    *sem = nullptr;
     return 0;
 }
 
@@ -315,6 +292,16 @@ int PS4_SYSV_ABI posix_sem_post(PthreadSem** sem) {
     return 0;
 }
 
+int PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
+    if (sem == nullptr || *sem == nullptr) {
+        *__Error() = POSIX_EINVAL;
+        return -1;
+    }
+    delete *sem;
+    *sem = nullptr;
+    return 0;
+}
+
 int PS4_SYSV_ABI posix_sem_getvalue(PthreadSem** sem, int* sval) {
     if (sem == nullptr || *sem == nullptr) {
         *__Error() = POSIX_EINVAL;
@@ -324,77 +311,6 @@ int PS4_SYSV_ABI posix_sem_getvalue(PthreadSem** sem, int* sval) {
         *sval = (*sem)->value;
     }
     return 0;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemInit(PthreadSem** sem, int flag, u32 value, const char* name) {
-    if (flag != 0) {
-        return ORBIS_KERNEL_ERROR_EINVAL;
-    }
-
-    s32 ret = posix_sem_init(sem, 0, value);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemDestroy(PthreadSem** sem) {
-    s32 ret = posix_sem_destroy(sem);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemWait(PthreadSem** sem) {
-    s32 ret = posix_sem_wait(sem);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemTrywait(PthreadSem** sem) {
-    s32 ret = posix_sem_trywait(sem);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemTimedwait(PthreadSem** sem, u32 usec) {
-    OrbisKernelTimespec time{};
-    time.tv_sec = usec / 1000000;
-    time.tv_nsec = (usec % 1000000) * 1000;
-
-    s32 ret = posix_sem_timedwait(sem, &time);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemPost(PthreadSem** sem) {
-    s32 ret = posix_sem_post(sem);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI scePthreadSemGetvalue(PthreadSem** sem, int* sval) {
-    s32 ret = posix_sem_getvalue(sem, sval);
-    if (ret != 0) {
-        return ErrnoToSceKernelError(*__Error());
-    }
-
-    return ORBIS_OK;
 }
 
 void RegisterSemaphore(Core::Loader::SymbolsResolver* sym) {
@@ -408,20 +324,12 @@ void RegisterSemaphore(Core::Loader::SymbolsResolver* sym) {
 
     // Posix
     LIB_FUNCTION("pDuPEf3m4fI", "libScePosix", 1, "libkernel", 1, 1, posix_sem_init);
-    LIB_FUNCTION("cDW233RAwWo", "libScePosix", 1, "libkernel", 1, 1, posix_sem_destroy);
     LIB_FUNCTION("YCV5dGGBcCo", "libScePosix", 1, "libkernel", 1, 1, posix_sem_wait);
     LIB_FUNCTION("WBWzsRifCEA", "libScePosix", 1, "libkernel", 1, 1, posix_sem_trywait);
     LIB_FUNCTION("w5IHyvahg-o", "libScePosix", 1, "libkernel", 1, 1, posix_sem_timedwait);
     LIB_FUNCTION("IKP8typ0QUk", "libScePosix", 1, "libkernel", 1, 1, posix_sem_post);
+    LIB_FUNCTION("cDW233RAwWo", "libScePosix", 1, "libkernel", 1, 1, posix_sem_destroy);
     LIB_FUNCTION("Bq+LRV-N6Hk", "libScePosix", 1, "libkernel", 1, 1, posix_sem_getvalue);
-
-    LIB_FUNCTION("GEnUkDZoUwY", "libkernel", 1, "libkernel", 1, 1, scePthreadSemInit);
-    LIB_FUNCTION("Vwc+L05e6oE", "libkernel", 1, "libkernel", 1, 1, scePthreadSemDestroy);
-    LIB_FUNCTION("C36iRE0F5sE", "libkernel", 1, "libkernel", 1, 1, scePthreadSemWait);
-    LIB_FUNCTION("H2a+IN9TP0E", "libkernel", 1, "libkernel", 1, 1, scePthreadSemTrywait);
-    LIB_FUNCTION("fjN6NQHhK8k", "libkernel", 1, "libkernel", 1, 1, scePthreadSemTimedwait);
-    LIB_FUNCTION("aishVAiFaYM", "libkernel", 1, "libkernel", 1, 1, scePthreadSemPost);
-    LIB_FUNCTION("DjpBvGlaWbQ", "libkernel", 1, "libkernel", 1, 1, scePthreadSemGetvalue);
 }
 
 } // namespace Libraries::Kernel

@@ -16,6 +16,8 @@ class GameController;
 
 namespace Frontend {
 
+void RefreshMappings();
+
 enum class WindowSystemType : u8 {
     Headless,
     Windows,
@@ -41,8 +43,6 @@ struct WindowSystemInfo {
 };
 
 class WindowSDL {
-    int keyboard_grab = 0;
-
 public:
     explicit WindowSDL(s32 width, s32 height, Input::GameController* controller,
                        std::string_view window_title);
@@ -68,16 +68,15 @@ public:
         return window_info;
     }
 
-    void WaitEvent();
-    void InitTimers();
-
-    void RequestKeyboard();
-    void ReleaseKeyboard();
+    void waitEvent();
+    void initTimers();
 
 private:
-    void OnResize();
-    void OnKeyPress(const SDL_Event* event);
-    void OnGamepadEvent(const SDL_Event* event);
+    void onResize();
+    void parseconfig();
+    void OnKeyboardMouseInput(const SDL_Event* event);
+    void onGamepadEvent(const SDL_Event* event);
+    int sdlGamepadToOrbisButton(u8 button);
 
 private:
     s32 width;
