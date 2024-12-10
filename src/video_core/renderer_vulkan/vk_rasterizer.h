@@ -36,14 +36,6 @@ public:
         return buffer_cache;
     }
 
-    [[nodiscard]] Scheduler& GetScheduler() noexcept {
-        return scheduler;
-    }
-
-    [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
-        return buffer_cache;
-    }
-
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
